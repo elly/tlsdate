@@ -242,6 +242,26 @@ sync_and_save (int hwclock_fd, int should_sync, int should_save)
     }
 }
 
+int
+add_jitter (int base, int jitter)
+{
+  static int did_init = 0;
+  if (!jitter)
+    return base;
+  if (!did_init) {
+    int fd = 0;
+    int seed = 0;
+    fd = open("/dev/urandom", O_RDONLY);
+    if (fd > 0 && read(fd, &seed, sizeof(seed)) == sizeof(seed))
+      /* success! */;
+    else
+      seed = time(NULL);
+    close(fd);
+    srand(seed);
+  }
+  return base + (abs(random()) % (2 * jitter)) - jitter;
+}
+
 #ifdef TLSDATED_MAIN
 #ifdef HAVE_DBUS
 void
@@ -291,6 +311,7 @@ usage (const char *progn)
   printf ("  -c <path> set the cache directory\n");
   printf ("  -a <n>    run at most every n seconds in steady state\n");
   printf ("  -m <n>    run at most once every n seconds in steady state\n");
+  printf ("  -j <n>    add up to n seconds jitter to steady state checks\n");
   printf ("  -l        don't load disk timestamps\n");
   printf ("  -s        don't save disk timestamps\n");
   printf ("  -v        be verbose\n");
@@ -319,10 +340,11 @@ main (int argc, char *argv[], char *envp[])
   int should_netlink = DEFAULT_USE_NETLINK;
   int dry_run = DEFAULT_DRY_RUN;
   time_t last_success = 0;
+  int jitter = 0;
 
   /* Parse arguments */
   int opt;
-  while ((opt = getopt (argc, argv, "hwrpt:d:T:D:c:a:lsvm:")) != -1)
+  while ((opt = getopt (argc, argv, "hwrpt:d:T:D:c:a:lsvm:j:")) != -1)
     {
       switch (opt)
   {
@@ -365,6 +387,9 @@ main (int argc, char *argv[], char *envp[])
   case 'm':
     min_steady_state_interval = atoi (optarg);
     break;
+  case 'j':
+    jitter = atoi (optarg);
+    break;
   case 'h':
   default:
     usage (argv[0]);
@@ -391,6 +416,9 @@ main (int argc, char *argv[], char *envp[])
     fatal ("supplied base path is too long: '%s'", base_path);
   if (strlen (timestamp_path) + strlen (kTempSuffix) >= PATH_MAX)
     fatal ("supplied base path is too long: '%s'", base_path);
+  if (jitter >= steady_state_interval)
+    fatal ("jitter must be less than steady state interval (%d >= %d)",
+           jitter, steady_state_interval);
 
   /* grab a handle to /dev/rtc for sync_hwclock() */
   if (should_sync_hwclock && (hwclock_fd = open ("/dev/rtc", O_RDONLY)) < 0)
@@ -444,7 +472,8 @@ main (int argc, char *argv[], char *envp[])
    * this should handle cases like a VPN being brought up and down
    * periodically.
    */
-  while (wait_for_event (&rtc, should_netlink, steady_state_interval) >= 0)
+  int wait = add_jitter(steady_state_interval, jitter);
+  while (wait_for_event (&rtc, should_netlink, wait) >= 0)
     {
       /*
        * If a route just came up, run tlsdate; if it
@@ -452,6 +481,7 @@ main (int argc, char *argv[], char *envp[])
        * from now on.
        */
       int i;
+      wait = add_jitter(steady_state_interval, jitter);
       if (time (NULL) - last_success < min_steady_state_interval)
         continue;
       for (i = 0; i < max_tries &&
