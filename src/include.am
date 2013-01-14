@@ -21,9 +21,10 @@ src_tlsdate_helper_SOURCES = src/tlsdate-helper.c
 src_tlsdate_helper_SOURCES+= src/proxy-bio.c
 src_tlsdate_helper_SOURCES+= src/util.c
 
-src_tlsdated_CFLAGS = -DTLSDATED_MAIN
+src_tlsdated_CFLAGS = -DTLSDATED_MAIN -g
 src_tlsdated_LDADD = -lcrypto
-src_tlsdated_SOURCES = src/routeup.c
+src_tlsdated_SOURCES = src/uconf.c
+src_tlsdated_SOURCES+= src/routeup.c
 src_tlsdated_SOURCES+= src/tlsdated.c
 src_tlsdated_SOURCES+= src/util.c
 
