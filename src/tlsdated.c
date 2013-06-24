@@ -43,7 +43,6 @@
 #include "src/tlsdate.h"
 
 const char *kCacheDir = DEFAULT_DAEMON_CACHEDIR;
-const char *kTempSuffix = DEFAULT_DAEMON_TMPSUFFIX;
 
 int
 is_sane_time (time_t ts)
@@ -145,25 +144,15 @@ tlsdate (struct opts *opts, char *envp[])
 int
 load_disk_timestamp (const char *path, time_t * t)
 {
-  int fd = open (path, O_RDONLY | O_NOFOLLOW);
   time_t tmpt;
-  if (fd < 0)
-    {
-      perror ("Can't open %s for reading", path);
-      return -1;
-    }
-  if (read (fd, &tmpt, sizeof (tmpt)) != sizeof (tmpt))
-    {
-      perror ("Can't read seconds from %s", path);
-      close (fd);
-      return -1;
-    }
-  close (fd);
-  if (!is_sane_time (tmpt))
-    {
-      perror ("Timevalue not sane: %lu", tmpt);
-      return -1;
-    }
+  if (platform->file_read(path, &tmpt, sizeof(tmpt))) {
+    info("can't load time file");
+    return -1;
+  }
+  if (!is_sane_time(tmpt)) {
+    info("time %lu not sane", tmpt);
+    return -1;
+  }
   *t = tmpt;
   return 0;
 }
@@ -172,34 +161,8 @@ load_disk_timestamp (const char *path, time_t * t)
 void
 save_disk_timestamp (const char *path, time_t t)
 {
-  char tmp[PATH_MAX];
-  int fd;
-
-  if (snprintf (tmp, sizeof (tmp), "%s%s", path, kTempSuffix) >= sizeof (tmp))
-    {
-      pinfo ("Path %s too long to use", path);
-      exit (1);
-    }
-
-  if ((fd = open (tmp, O_WRONLY | O_CREAT | O_NOFOLLOW | O_TRUNC,
-      S_IRUSR | S_IWUSR)) < 0)
-    {
-      pinfo ("open failed");
-      return;
-    }
-  if (write (fd, &t, sizeof (t)) != sizeof (t))
-    {
-      pinfo ("write failed");
-      close (fd);
-      return;
-    }
-  if (close (fd))
-    {
-      pinfo ("close failed");
-      return;
-    }
-  if (rename (tmp, path))
-    pinfo ("rename failed");
+  if (platform->file_write(path, &t, sizeof(t)))
+    info("saving disk timestamp failed");
 }
 
 /*
@@ -210,38 +173,17 @@ save_disk_timestamp (const char *path, time_t t)
  * this function except try later.
  */
 void
-sync_hwclock (int fd)
+sync_hwclock (void *rtc_handle)
 {
   struct timeval tv;
-  struct tm *tm;
-  struct rtc_time rtctm;
+  if (platform->time_get(&tv))
+  {
+    pinfo("gettimeofday() failed");
+    return;
+  }
 
-  if (gettimeofday (&tv, NULL))
-    {
-      pinfo ("gettimeofday() failed");
-      return;
-    }
-
-  tm = gmtime (&tv.tv_sec);
-
-  /* these structs are identical, but separately defined */
-  rtctm.tm_sec = tm->tm_sec;
-  rtctm.tm_min = tm->tm_min;
-  rtctm.tm_hour = tm->tm_hour;
-  rtctm.tm_mday = tm->tm_mday;
-  rtctm.tm_mon = tm->tm_mon;
-  rtctm.tm_year = tm->tm_year;
-  rtctm.tm_wday = tm->tm_wday;
-  rtctm.tm_yday = tm->tm_yday;
-  rtctm.tm_isdst = tm->tm_isdst;
-
-  if (ioctl (fd, RTC_SET_TIME, &rtctm))
-    {
-      pinfo ("ioctl(%d, RTC_SET_TIME, ...) failed", fd);
-      return;
-    }
-
-  info ("synced rtc to sysclock");
+  if (platform->rtc_write(rtc_handle, &tv))
+    info("rtc_write() failed");
 }
 
 /*
@@ -274,14 +216,14 @@ wait_for_event (struct routeup *rtc, int should_netlink, int timeout)
 char timestamp_path[PATH_MAX];
 
 void
-sync_and_save (int hwclock_fd, int should_sync, int should_save)
+sync_and_save (void *hwclock_handle, int should_save)
 {
   struct timeval tv;
-  if (should_sync)
-    sync_hwclock (hwclock_fd);
+  if (hwclock_handle)
+    sync_hwclock (hwclock_handle);
   if (should_save)
     {
-      if (gettimeofday (&tv, NULL))
+      if (platform->time_get(&tv))
   pfatal ("gettimeofday() failed");
       save_disk_timestamp (timestamp_path, tv.tv_sec);
     }
@@ -318,6 +260,12 @@ add_jitter (int base, int jitter)
     fatal ("RAND_bytes() failed");
 #endif
   return base + (abs(n) % (2 * jitter)) - jitter;
+}
+
+int
+calc_wait_time (const struct opts *opts)
+{
+  return add_jitter (opts->steady_state_interval, opts->jitter);
 }
 
 #ifdef TLSDATED_MAIN
@@ -608,11 +556,30 @@ check_conf(struct opts *opts)
            opts->jitter, opts->steady_state_interval);
 }
 
+struct tlsdated_state {
+	struct routeup rtc;
+	time_t last_success;
+	struct opts *opts;
+};
+
+#if 0
+void
+active_mode(struct tlsdated_state *state)
+{
+  /* how long to wait between retries when we haven't seen a route announcement.
+   * It's okay for this interval to be short(ish). */
+  static const int kTryDelay = 300;
+  do {
+    
+  } while wait_for_event(&state->rtc, state->opts->should_netlink, kTryDelay);
+}
+#endif
+
 int API
 main (int argc, char *argv[], char *envp[])
 {
   struct routeup rtc;
-  int hwclock_fd = -1;
+  void *hwclock_handle = NULL;
   time_t last_success = 0;
   struct opts opts;
   int wait_time = 0;
@@ -636,11 +603,8 @@ main (int argc, char *argv[], char *envp[])
                               (char *) DEFAULT_PROXY);
 
   /* grab a handle to /dev/rtc for sync_hwclock() */
-  if (opts.should_sync_hwclock && (hwclock_fd = open (DEFAULT_RTC_DEVICE, O_RDONLY)) < 0)
-    {
+  if (opts.should_sync_hwclock && !(hwclock_handle = platform->rtc_open()))
       pinfo ("can't open hwclock fd");
-      opts.should_sync_hwclock = 0;
-    }
 
   /* set up a netlink context if we need one */
   if (opts.should_netlink && routeup_setup (&rtc))
@@ -664,7 +628,7 @@ main (int argc, char *argv[], char *envp[])
        * don't save here - we either just loaded this time or used the
        * default time, and neither of those are good to save
        */
-      sync_and_save (hwclock_fd, opts.should_sync_hwclock, 0);
+      sync_and_save (hwclock_handle, 0);
     }
 
   /* register a signal handler to save time at shutdown */
@@ -678,7 +642,7 @@ main (int argc, char *argv[], char *envp[])
    */
   if (!tlsdate (&opts, envp)) {
     last_success = time (NULL);
-    sync_and_save (hwclock_fd, opts.should_sync_hwclock, opts.should_save_disk);
+    sync_and_save (hwclock_handle, opts.should_save_disk);
     dbus_announce();
   }
 
@@ -688,7 +652,30 @@ main (int argc, char *argv[], char *envp[])
    * this should handle cases like a VPN being brought up and down
    * periodically.
    */
-  wait_time = add_jitter(opts.steady_state_interval, opts.jitter);
+
+  /*
+   * The event loop.
+   * When we start up, we may have no time fix at all; we'll call this "active
+   * mode", where we are actively looking for opportunities to get a time fix.
+   * Once we get a time fix, we go into "passive mode", where we're looking to
+   * prevent clock drift or rtc corruption. The difference between these two
+   * modes is whether we're aggressive about checking for time after network
+   * routes come up.
+   *
+   * To do this, we create some event sources:
+   *   e0 = event_routeup()
+   *   e1 = event_suspend()
+   *   e2 = event_every(86400 seconds)
+   * Then we create a couple of composite events:
+   *   active = event_anyof(3, e0, e1, e2)
+   *   passive = event_anyof(2, e1, e2)
+   * Now we tell which mode we're in by which composite event we're waiting for.
+   * Whenever our wait for an event returns, we start checking (i.e., running
+   * tlsdate with exponential backoff until it succeeds). If checking succeeds
+   * and we were in active state, we go to passive state; otherwise we return to
+   * our previous state.
+   */
+  wait_time = calc_wait_time(&opts);
   while (wait_for_event (&rtc, opts.should_netlink, wait_time) >= 0)
     {
       /*
@@ -698,7 +685,7 @@ main (int argc, char *argv[], char *envp[])
        */
       int i;
       int backoff = opts.wait_between_tries;
-      wait_time = add_jitter(opts.steady_state_interval, opts.jitter);
+      wait_time = calc_wait_time(&opts);
       if (time (NULL) - last_success < opts.min_steady_state_interval)
         continue;
       for (i = 0; i < opts.max_tries && tlsdate (&opts, envp); ++i) {
@@ -712,7 +699,7 @@ main (int argc, char *argv[], char *envp[])
       {
         last_success = time (NULL);
         info ("tlsdate succeeded");
-        sync_and_save (hwclock_fd, opts.should_sync_hwclock, opts.should_save_disk);
+        sync_and_save (hwclock_handle, opts.should_save_disk);
         dbus_announce();
       }
     }

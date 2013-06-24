@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 FIXTURE(tempdir) {
@@ -195,6 +196,24 @@ TEST(proxy_override) {
   EXPECT_EQ(0, tlsdate(&opts, environ));
 }
 
+FIXTURE(mock_platform) {
+  struct platform platform;
+  struct platform *old_platform;
+};
+
+FIXTURE_SETUP(mock_platform) {
+  self->old_platform = platform;
+  self->platform.rtc_open = NULL;
+  self->platform.rtc_write = NULL;
+  self->platform.rtc_read = NULL;
+  self->platform.rtc_close = NULL;
+  platform = &self->platform;
+}
+
+FIXTURE_TEARDOWN(mock_platform) {
+  platform = self->old_platform;
+}
+
 TEST(tlsdate_args) {
   struct source s1 = {
     .next = NULL,
@@ -211,6 +230,59 @@ TEST(tlsdate_args) {
   opts.leap = 1;
   verbose = 1;
   EXPECT_EQ(9, tlsdate(&opts, environ));
+}
+
+TEST_F(mock_platform, sync_hwclock) {
+  struct timeval now;
+  void *fake_handle = (void *)&now;
+  int done = 0;
+  now.tv_sec = 12345678;
+  int test_time_get(struct timeval *tv) {
+    tv->tv_sec = now.tv_sec;
+    tv->tv_usec = now.tv_usec;
+    return 0;
+  }
+  int test_rtc_write(void *handle, const struct timeval *tv) {
+    ASSERT_EQ(tv->tv_sec, now.tv_sec);
+    ASSERT_EQ(handle, fake_handle);
+    done++;
+    return 0;
+  }
+  self->platform.time_get = test_time_get;
+  self->platform.rtc_write = test_rtc_write;
+  sync_hwclock(fake_handle);
+  ASSERT_EQ(done, 1);
+}
+
+TEST_F(mock_platform, sync_and_save) {
+  struct timeval now;
+  void *fake_handle = (void *)&now;
+  int done = 0;
+  now.tv_sec = 12345678;
+  int test_time_get(struct timeval *tv) {
+    tv->tv_sec = now.tv_sec;
+    tv->tv_usec = now.tv_usec;
+    return 0;
+  }
+  int test_rtc_write(void *handle, const struct timeval *tv) {
+    ASSERT_EQ(tv->tv_sec, now.tv_sec);
+    ASSERT_EQ(handle, fake_handle);
+    done++;
+    return 0;
+  }
+  int test_file_write(const char *path, void *buf, size_t sz) {
+    ASSERT_STREQ(path, timestamp_path);
+    done++;
+    return 0;
+  }
+  self->platform.time_get = test_time_get;
+  self->platform.rtc_write = test_rtc_write;
+  self->platform.file_write = test_file_write;
+  sync_and_save(fake_handle, 1);
+  ASSERT_EQ(done, 2);
+  done = 0;
+  sync_and_save(fake_handle, 0);
+  ASSERT_EQ(done, 1);
 }
 
 TEST_HARNESS_MAIN

@@ -424,6 +424,12 @@ endif
 endif
 endif
 
+src_event_unittest_SOURCES = src/event.c
+src_event_unittest_SOURCES+= src/event-unittest.c
+src_event_unittest_SOURCES+= src/routeup.c
+src_event_unittest_SOURCES+= src/util.c
+check_PROGRAMS+= src/event_unittest
+
 if !TARGET_OSX
 check_PROGRAMS+= src/test/proxy-override src/test/return-argc \
                  src/test/rotate src/test/sleep-wrap
